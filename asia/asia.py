@@ -14,16 +14,14 @@ import networkx as nx
 from pgmpy.readwrite import BIFReader
 from pgmpy.sampling import BayesianModelSampling
 from pgmpy.models import BayesianNetwork
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from itertools import combinations
 import psutil
 import ray
-import time
 from scipy.special import expit as sigmoid
 from scipy.special import logit
 from scipy.stats import norm
-import threading
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import PolynomialFeatures
@@ -31,16 +29,10 @@ from pgmpy.base import DAG
 # =========================
 # ② Global determinism control
 # =========================
-GLOBAL_SEED = 20250902  # You can change it to any fixed integer
+GLOBAL_SEED = 20250902  
 def set_global_determinism(seed: int):
     random.seed(seed)
     np.random.seed(seed)
-
-
-def monitor_cpu(interval=5):
-    while True:
-        usage = psutil.cpu_percent(interval=interval, percpu=False)
-        print(f"🧠 Current CPU usage: {usage:.1f}%")
 
 
 def load_dag_from_bif(bif_path):
@@ -65,8 +57,6 @@ def estimate_marginal_effect(data, treatment, outcome, vas, all_mediators):
     - AIPW structure with two marginalization steps.
     - Q-model: PolynomialFeatures (degree=2) + Multinomial Logistic Regression returning E[Y|·].
     """
-
-
 
     # ---------- 0) Split Z1 / Z2 (stable order) ----------
     mediators_in_vas = vas & set(all_mediators)
@@ -226,14 +216,6 @@ def estimate_marginal_effect(data, treatment, outcome, vas, all_mediators):
 # =========================
 # Adjustment set search related
 # =========================
-def find_true_backdoor_paths(graph, source, target):
-    paths = []
-    for path in nx.all_simple_paths(graph.to_undirected(), source, target):
-        if graph.has_edge(path[0], path[1]):
-            continue
-        paths.append(path)
-    return paths
-
 def get_all_mediator_path_nodes(graph, treatment, outcome):
     mediators = set()
     for path in nx.all_simple_paths(graph, source=treatment, target=outcome):
@@ -318,7 +300,7 @@ def _proper_backdoor_graph_DAG(G: nx.DiGraph, Xset, Yset):
     return H
 
 # -------------------------
-# Precise backdoor checker for c2 (NEW)
+# Precise backdoor checker for c2 
 # -------------------------
 def _is_collider(G: nx.DiGraph, a, b, c):
     """
@@ -458,7 +440,7 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     Z = set(adj_set)
     M = set(mediators)
 
-    # ---------- New c1/c2: Adjustment criterion for X={A}∪Z1 (NOT {A}∪M),
+    # ----------  c1/c2: Adjustment criterion for X={A}∪Z1 (NOT {A}∪M),
     #                       enforced only on the "confounder part" Z_c = Z \ M ----------
     Z1 = Z & M               # mediators that are actually included in Z
     Zc = Z - M               # the confounder part to be checked by the adjustment criterion
@@ -473,15 +455,15 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     Gpbd = _proper_backdoor_graph_DAG(graph, T, Yset)
     c2, _c2_details = _is_d_separated_backdoor_precise(Gpbd, T, Yset, Zc_set=Zc, verbose=False)
 
-    # ---------- c3: unchanged ----------
+    # ---------- c3 ----------
     try:
         dir_paths = list(nx.all_simple_paths(graph, source=treatment, target=outcome))
     except Exception:
         dir_paths = []
     med_paths = [p for p in dir_paths if any(n in M for n in p[1:-1])]
-    c3 = all(any(v in Z for v in p[1:-1]) for p in med_paths) if med_paths else True
+    c3 = all(any(v in Z1 for v in p[1:-1]) for p in med_paths) if med_paths else True
 
-    # ---------- c4: unchanged (you can reuse Z1 above; recomputing is harmless) ----------
+    # ---------- c4 ----------
     try:
         pa_y = set(graph.predecessors(outcome))
     except Exception:
@@ -492,7 +474,7 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     N_nonmed_parents = pa_y - M_prime
 
     X = M_prime - Z1
-    Yset = N_nonmed_parents
+    Yset = set(N_nonmed_parents) | {treatment}
     if len(X) == 0 or len(Yset) == 0:
         c4 = True
     else:
@@ -528,33 +510,6 @@ def estimate_single_seed(vas, model, treatment, outcome, all_mediators, n_sample
         return (str(sorted(vas)), int(n_samples), None)
 
 
-@ray.remote
-def estimate_variance_for_vas_ray(vas, model, treatment, outcome, all_mediators, n_samples, n_rep=50):
-    # Keep your original intention; set a fixed base seed when called
-    import os as _os, random as _random
-    import numpy as _np
-    _os.environ["PYTHONHASHSEED"] = "0"
-    _random.seed(GLOBAL_SEED)
-    _np.random.seed(GLOBAL_SEED)
-
-    estimates = []
-    for seed in range(n_rep):
-        try:
-            data = sample_data_from_bif_model(model, n_samples=n_samples, seed=seed)
-            est = estimate_marginal_effect(data, treatment, outcome, vas, all_mediators)
-            estimates.append(est)
-        except Exception:
-            pass
-    if len(estimates) >= 2:
-        var = float(np.var(estimates, ddof=1))
-        mean_est = float(np.mean(estimates))
-    elif len(estimates) == 1:
-        var = float('nan')
-        mean_est = float(estimates[0])
-    else:
-        var = float('nan')
-        mean_est = float('nan')
-    return (str(sorted(vas)), mean_est, var, len(estimates))
 
 
 if __name__ == '__main__':
@@ -578,8 +533,6 @@ if __name__ == '__main__':
             }
         }
     )
-    monitor_thread = threading.Thread(target=monitor_cpu, args=(5,), daemon=True)
-    monitor_thread.start()
 
     # ============ 2) Configuration ============
     bif_path = r'data/asia.bif'

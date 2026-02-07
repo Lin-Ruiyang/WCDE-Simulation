@@ -19,27 +19,16 @@ except Exception:
 import numpy as np
 import pandas as pd
 import networkx as nx
-from networkx.algorithms.d_separation import d_separated as is_d_separator
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.calibration import CalibratedClassifierCV
 from itertools import combinations
 import psutil
 import ray
 import time
-import statsmodels.api as sm
 from scipy.special import expit as sigmoid
-from scipy.special import logit
 import random
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import SplineTransformer, StandardScaler
 from sklearn.compose import ColumnTransformer
-from scipy.stats import norm
-from scipy.integrate import quad
-import gc
-import threading
 from pgmpy.base import DAG
 # ========================= Utility: enforce determinism inside Worker/main process =========================
 def _enforce_worker_determinism(seed: int = 0):
@@ -131,12 +120,16 @@ def generate_data_from_dag(G, coefficients, n_samples=1000, seed=0, nonlinear_fu
 
     return data, selected_func
 
-# ============ 3. Theoretical truth: Monte Carlo approximation for WCDE ============
+# ============ 3. Theoretical truth: Monte Carlo approximation for (marginal x marginal) target ============
 
 def compute_theoretical_wcde_montecarlo(coeffs, nonlinear_func,
                                         n_g1=4000, n_b2g2=4000, seed=0):
     """
-    Approximate the true value: return ( E[Y|do(A=1)] - E[Y|do(A=0)] ) (not multiplied by 0.5)
+    Target (marginal x marginal):
+      T(a) = E_{G1 ~ P_nat(G1)}  E_{(B2,G2) ~ P_nat(B2,G2)} [ Y(a, G1, G2) ].
+    Return: T(1) - T(0)  (not multiplied by 0.5)
+
+    DAG (Figure 2): B2->A,G1,G2; A->G1,Y; G1->Y; G2->Y; A->Y
     """
     np.random.seed(seed)
 
@@ -144,54 +137,54 @@ def compute_theoretical_wcde_montecarlo(coeffs, nonlinear_func,
     sd_G2 = 0.25
     sd_G1 = 0.25
 
-    # 1) Sample B2 to construct the marginal of G1 under the natural mechanism
-    b2_arr = np.random.normal(0, sd_B2, n_g1)
+    # ------------------------------------------------------------
+    # 1) Sample G1 from its NATURAL MARGINAL P_nat(G1)
+    #    by simulating (B2 -> A -> G1) under the natural mechanism,
+    #    then discarding (A,B2).
+    # ------------------------------------------------------------
+    b2_for_g1 = np.random.normal(0, sd_B2, n_g1)
 
-    # p(A=1 | B2) = sigmoid( f([B2_A * B2]) )
-    eta_terms = np.vstack([coeffs['B2_A'] * b2_arr])        # (1, n_g1)
-    eta_latent = nonlinear_func(eta_terms)                  # (n_g1,)
-    p_a1 = np.clip(sigmoid(eta_latent), 1e-6, 1-1e-6)
+    # A | B2 : sigmoid( f([B2_A * B2]) )
+    eta_terms  = np.vstack([coeffs['B2_A'] * b2_for_g1])   
+    eta_latent = nonlinear_func(eta_terms)                
+    p_a1 = np.clip(sigmoid(eta_latent), 1e-6, 1 - 1e-6)
+    A_nat = (np.random.rand(n_g1) < p_a1).astype(float)
 
-    # Mean of G1|A=a,B2=b2: f([B2_G1 * B2, A_G1 * a])
-    a0_vec = np.zeros_like(b2_arr)
-    a1_vec = np.ones_like(b2_arr)
+    # G1 | (A, B2) : f([B2_G1 * B2, A_G1 * A]) + noise
+    g1_terms  = np.vstack([
+        coeffs['B2_G1'] * b2_for_g1,
+        coeffs['A_G1']  * A_nat
+    ])  # (2, n_g1)
+    g1_latent = nonlinear_func(g1_terms)                 
+    g1_samples = np.random.normal(g1_latent, sd_G1)       
 
-    mu0_terms = np.vstack([
-        coeffs['B2_G1'] * b2_arr,
-        coeffs['A_G1']  * a0_vec
-    ])
-    mu1_terms = np.vstack([
-        coeffs['B2_G1'] * b2_arr,
-        coeffs['A_G1']  * a1_vec
-    ])
+    # ------------------------------------------------------------
+    # 2) Sample (B2,G2) from its NATURAL JOINT P_nat(B2,G2)
+    #    by simulating B2 then G2|B2, and keep both.
+    # ------------------------------------------------------------
+    b2_pool = np.random.normal(0, sd_B2, n_b2g2)
 
-    mu0 = nonlinear_func(mu0_terms)
-    mu1 = nonlinear_func(mu1_terms)
+    # G2 | B2 : f([B2_G2 * B2]) + noise
+    g2_terms  = np.vstack([coeffs['B2_G2'] * b2_pool])     
+    g2_mean   = nonlinear_func(g2_terms)                   
+    g2_pool   = np.random.normal(g2_mean, sd_G2)            
 
-    g1_a0 = np.random.normal(mu0, sd_G1)
-    g1_a1 = np.random.normal(mu1, sd_G1)
-
-    # Marginal of G1 under the natural mechanism: mixture by P(A=1|B2)
-    g1_samples = np.where(np.random.rand(n_g1) < p_a1, g1_a1, g1_a0)
-
-    # For fixed g1, E[Y | do(a), g1]: integrate over (B2,G2)
+    # ------------------------------------------------------------
+    # For fixed g1, integrate over (B2,G2) marginal (here only G2 enters Y)
+    # ------------------------------------------------------------
     def inner_EY_given_a_g1(a, g1):
-        b2 = np.random.normal(0, sd_B2, n_b2g2)
-        # G2 mean: f([B2_G2 * B2])
-        g2_terms = np.vstack([coeffs['B2_G2'] * b2])        # (1, n_b2g2)
-        g2_mean  = nonlinear_func(g2_terms)                 # (n_b2g2,)
-        g2 = np.random.normal(g2_mean, sd_G2)
-
+        g2 = g2_pool
         n = len(g2)
-        g1_array = np.full(n, g1)
-        a_array  = np.full(n, a)
+
+        g1_array = np.full(n, float(g1))
+        a_array  = np.full(n, float(a))
 
         y_terms = np.vstack([
             coeffs['G1_Y'] * g1_array,
             coeffs['G2_Y'] * g2,
             coeffs['A_Y']  * a_array
-        ])
-        y = nonlinear_func(y_terms)
+        ])  # (3, n)
+        y = nonlinear_func(y_terms)  
         return float(np.mean(y))
 
     def T(a):
@@ -200,24 +193,10 @@ def compute_theoretical_wcde_montecarlo(coeffs, nonlinear_func,
 
     return (T(1) - T(0))
 
-# ========================= NetworkX Traversal Order Fix =========================
-def _sorted_graph(g: nx.DiGraph) -> nx.DiGraph:
-    h = nx.DiGraph()
-    h.add_nodes_from(sorted(g.nodes()))
-    h.add_edges_from(sorted(g.edges()))
-    return h
 
 # =========================
 # Adjustment set search related
 # =========================
-def find_true_backdoor_paths(graph, source, target):
-    paths = []
-    for path in nx.all_simple_paths(graph.to_undirected(), source, target):
-        if graph.has_edge(path[0], path[1]):
-            continue
-        paths.append(path)
-    return paths
-
 def get_all_mediator_path_nodes(graph, treatment, outcome):
     mediators = set()
     for path in nx.all_simple_paths(graph, source=treatment, target=outcome):
@@ -303,7 +282,7 @@ def _proper_backdoor_graph_DAG(G: nx.DiGraph, Xset, Yset):
     return H
 
 # -------------------------
-# Precise backdoor checker for c2 (NEW)
+# Precise backdoor checker for c2 
 # -------------------------
 def _is_collider(G: nx.DiGraph, a, b, c):
     """
@@ -443,7 +422,7 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     Z = set(adj_set)
     M = set(mediators)
 
-    # ---------- New c1/c2: Adjustment criterion for X={A}∪Z1 (NOT {A}∪M),
+    # ---------- c1/c2: Adjustment criterion for X={A}∪Z1 (NOT {A}∪M),
     #                       enforced only on the "confounder part" Z_c = Z \ M ----------
     Z1 = Z & M               # mediators that are actually included in Z
     Zc = Z - M               # the confounder part to be checked by the adjustment criterion
@@ -458,15 +437,15 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     Gpbd = _proper_backdoor_graph_DAG(graph, T, Yset)
     c2, _c2_details = _is_d_separated_backdoor_precise(Gpbd, T, Yset, Zc_set=Zc, verbose=False)
 
-    # ---------- c3: unchanged ----------
+    # ---------- c3 ----------
     try:
         dir_paths = list(nx.all_simple_paths(graph, source=treatment, target=outcome))
     except Exception:
         dir_paths = []
     med_paths = [p for p in dir_paths if any(n in M for n in p[1:-1])]
-    c3 = all(any(v in Z for v in p[1:-1]) for p in med_paths) if med_paths else True
+    c3 = all(any(v in Z1 for v in p[1:-1]) for p in med_paths) if med_paths else True
 
-    # ---------- c4: unchanged (you can reuse Z1 above; recomputing is harmless) ----------
+    # ---------- c4 ----------
     try:
         pa_y = set(graph.predecessors(outcome))
     except Exception:
@@ -477,7 +456,7 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     N_nonmed_parents = pa_y - M_prime
 
     X = M_prime - Z1
-    Yset = N_nonmed_parents
+    Yset = set(N_nonmed_parents) | {treatment}
     if len(X) == 0 or len(Yset) == 0:
         c4 = True
     else:
@@ -485,8 +464,9 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
 
     return c1 and c2 and c3 and c4
 
-def find_potential_adjustment_sets(candidate_vars):
-    return [set(c) for k in range(1, len(candidate_vars)+1) for c in combinations(candidate_vars, k)]
+def find_potential_adjustment_sets(G, treatment, outcome):
+    nodes = set(G.nodes()) - {treatment, outcome}
+    return [set(c) for k in range(1, len(nodes)+1) for c in combinations(nodes, k)]
 
 def filter_valid_structured_vas(graph, treatment, outcome, all_sets):
     med = get_all_mediator_path_nodes(graph, treatment, outcome)
@@ -704,14 +684,8 @@ def generate_coeffs_list_parallel(G, n_coeff_sets, seed_base=0):
     return coeffs_list
 
 # ========================= Ray: parallel estimation =========================
-def monitor_resources():
-    while True:
-        cpu_percent = psutil.cpu_percent(interval=1)
-        mem = psutil.virtual_memory()
-        print(f"[Resource Monitoring] CPU Usage: {cpu_percent}% | Memory Usage: {mem.used/1024**3:.1f}GB/{mem.total/1024**3:.1f}GB")
-        time.sleep(10)
 
-@ray.remote(num_cpus=0.25, max_retries=1)   # You can also try 0.25; too small may incur context switching overhead
+@ray.remote(num_cpus=0.25, max_retries=1)  
 def compute_for_adj_single(vas, coeffs_tuple, coeff_idx, n_rep, n_sample, treatment, outcome, all_mediators):
     _enforce_worker_determinism(seed=coeff_idx + 12345)
     coeffs, nonlinear_func, true_wcde = coeffs_tuple
@@ -844,8 +818,6 @@ if __name__ == '__main__':
     )
     print(f"Ray initialization complete: {num_cpus} CPUs, {object_store_memory/1024**3:.1f}GB object store")
 
-    monitor_thread = threading.Thread(target=monitor_resources, daemon=True)
-    monitor_thread.start()
 
     treat, out = 'A', 'Y'
     base_result_dir = "non-bac"

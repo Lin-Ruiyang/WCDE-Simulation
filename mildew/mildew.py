@@ -15,16 +15,14 @@ import pandas as pd
 import networkx as nx
 from pgmpy.readwrite import BIFReader
 from pgmpy.sampling import BayesianModelSampling
-from pgmpy.models import BayesianNetwork    
-from sklearn.ensemble import RandomForestRegressor 
 import ray
 import psutil
-from pgmpy.factors.discrete import TabularCPD
 from itertools import combinations
-import threading
-from collections import Counter, defaultdict
 from sklearn.pipeline import make_pipeline
 from pgmpy.base import DAG
+from pgmpy.models import DiscreteBayesianNetwork  
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import LogisticRegression
 # Global determinism control
 GLOBAL_SEED = 20250902
 def set_global_determinism(seed: int):
@@ -116,9 +114,12 @@ def sample_with_binary_treatment(model,
     all_rows = sum(len(x) for x in collected)
     if all_rows < n_samples:
         raise ValueError(
-            f"二值化后样本不足：目标 {n_samples}，仅得到 {all_rows}；已选两类: {picked}。"
-            f"可增大 oversample_factor/max_trials，或手动指定 level0/level1。"
+            f"Insufficient samples after binarization: target {n_samples}, "
+            f"but only {all_rows} obtained; selected classes: {picked}. "
+            f"Consider increasing oversample_factor/max_trials, "
+            f"or manually specifying level0/level1."
         )
+
 
     data_bin = pd.concat(collected, ignore_index=True)
 
@@ -127,8 +128,10 @@ def sample_with_binary_treatment(model,
         c1 = (data_bin[treatment] == 1).sum()
         if (c0 < min_each) or (c1 < min_each):
             raise ValueError(
-                f"达到总量但无法满足组内最小量：min_each={min_each}, count0={c0}, count1={c1}；"
-                f"请提高 oversample_factor 或更换两类。已选: {picked}"
+                f"Total sample size reached but per-class minimum not satisfied: "
+                f"min_each={min_each}, count0={c0}, count1={c1}; "
+                f"please increase oversample_factor or choose a different pair of classes. "
+                f"Selected: {picked}"
             )
 
     data_bin = data_bin.iloc[:n_samples].reset_index(drop=True)
@@ -142,11 +145,6 @@ def estimate_marginal_effect(data, treatment, outcome, vas, all_mediators):
     - Keep the exact AIPW + double-marginalization structure
     - Q model: PolynomialFeatures (degree 2) + Multinomial Logistic; predict -> E[Y|·]
     """
-    import numpy as np
-    import pandas as pd
-    from sklearn.preprocessing import PolynomialFeatures
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import make_pipeline
 
     # ---------- 0) Split Z1 / Z2 (stable order) ----------
     mediators_in_vas = vas & set(all_mediators)
@@ -309,13 +307,6 @@ def estimate_marginal_effect(data, treatment, outcome, vas, all_mediators):
 # =========================
 # Adjustment set search related
 # =========================
-def find_true_backdoor_paths(graph, source, target):
-    paths = []
-    for path in nx.all_simple_paths(graph.to_undirected(), source, target):
-        if graph.has_edge(path[0], path[1]):
-            continue
-        paths.append(path)
-    return paths
 
 def get_all_mediator_path_nodes(graph, treatment, outcome):
     mediators = set()
@@ -401,7 +392,7 @@ def _proper_backdoor_graph_DAG(G: nx.DiGraph, Xset, Yset):
     return H
 
 # -------------------------
-# Precise backdoor checker for c2 (NEW)
+# Precise backdoor checker for c2 
 # -------------------------
 def _is_collider(G: nx.DiGraph, a, b, c):
     """
@@ -541,7 +532,7 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     Z = set(adj_set)
     M = set(mediators)
 
-    # ---------- New c1/c2: Adjustment criterion for X={A}∪Z1 (NOT {A}∪M),
+    # ----------  c1/c2: Adjustment criterion for X={A}∪Z1 (NOT {A}∪M),
     #                       enforced only on the "confounder part" Z_c = Z \ M ----------
     Z1 = Z & M               # mediators that are actually included in Z
     Zc = Z - M               # the confounder part to be checked by the adjustment criterion
@@ -556,15 +547,15 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     Gpbd = _proper_backdoor_graph_DAG(graph, T, Yset)
     c2, _c2_details = _is_d_separated_backdoor_precise(Gpbd, T, Yset, Zc_set=Zc, verbose=False)
 
-    # ---------- c3: unchanged ----------
+    # ---------- c3 ----------
     try:
         dir_paths = list(nx.all_simple_paths(graph, source=treatment, target=outcome))
     except Exception:
         dir_paths = []
     med_paths = [p for p in dir_paths if any(n in M for n in p[1:-1])]
-    c3 = all(any(v in Z for v in p[1:-1]) for p in med_paths) if med_paths else True
+    c3 = all(any(v in Z1 for v in p[1:-1]) for p in med_paths) if med_paths else True
 
-    # ---------- c4: unchanged (you can reuse Z1 above; recomputing is harmless) ----------
+    # ---------- c4 ----------
     try:
         pa_y = set(graph.predecessors(outcome))
     except Exception:
@@ -575,7 +566,7 @@ def is_valid_structured_vas(graph, treatment, outcome, adj_set, mediators):
     N_nonmed_parents = pa_y - M_prime
 
     X = M_prime - Z1
-    Yset = N_nonmed_parents
+    Yset = set(N_nonmed_parents) | {treatment}
     if len(X) == 0 or len(Yset) == 0:
         c4 = True
     else:
@@ -613,41 +604,6 @@ def estimate_wcde_for_seed(vas, model, treatment, outcome, all_mediators, n_samp
     except Exception as e:
         return (tuple(sorted(vas)), n_samples, None)
 
-def estimate_variance_for_vas_ray(vas, model, treatment, outcome, all_mediators, n_samples, n_rep=3):
-    estimates = []
-    error_count = 0
-    for seed in range(n_rep):
-        try:
-            data, _chosen = sample_with_binary_treatment(
-                model, n_samples=n_samples, seed=seed, treatment=treatment,
-                oversample_factor=3, max_trials=30,
-                ensure_balance=True, min_each=max(1, n_samples//10)
-            )
-            wcde_est = estimate_marginal_effect(data, treatment, outcome, vas, all_mediators)
-            estimates.append(wcde_est)
-        except Exception as e:
-            error_count += 1
-            if error_count == 1:
-                print(f"Error for VAS {vas} (seed={seed}): {str(e)}")
-
-    if estimates:
-        mean_estimate = np.mean(estimates)
-        variance = np.var(estimates, ddof=1)
-        return (sorted(vas), mean_estimate, variance, len(estimates), error_count)
-    else:
-        print(f"Warning: All estimations failed for VAS {vas}")
-        return (sorted(vas), np.nan, np.nan, 0, error_count)
-
-
-def get_ancestors(model, node):
-    return nx.ancestors(model, node)
-
-
-def monitor_cpu(interval=300):
-    while True:
-        usage = psutil.cpu_percent(interval=interval, percpu=False)
-        print(f"Current CPU usage: {usage:.1f}%")
-
 
 if __name__ == '__main__':
     set_global_determinism(GLOBAL_SEED)
@@ -667,8 +623,6 @@ if __name__ == '__main__':
             }
         }
     )
-    monitor_thread = threading.Thread(target=monitor_cpu, args=(5,), daemon=True)
-    monitor_thread.start()
 
     bif_path = r'data/mildew.bif'
 
@@ -681,39 +635,39 @@ if __name__ == '__main__':
     # ① Build a graph from the full model edges to compute ancestors correctly
     graph_full = nx.DiGraph(model_full.edges())
 
-    # ② Keep only ancestors of outcome + outcome (optionally also keep treatment to avoid dropping it)
-    required_nodes = get_ancestors(graph_full, outcome).union({outcome})
-    # (Optional) If you want to keep treatment regardless of whether it's an ancestor of outcome, uncomment the next line:
-    # required_nodes = required_nodes.union({treatment})
+    # ② Nodes: explicitly sort to avoid nondeterminism from set iteration order
+    required_nodes_set = nx.ancestors(graph_full, outcome) | {outcome, treatment}
+    required_nodes = sorted(required_nodes_set)
+    required_nodes_lookup = set(required_nodes)
 
-    print("Generate data only for the following nodes:", sorted(required_nodes))
+    # ③ Edges: explicitly sort to avoid nondeterminism from edge iteration order
+    edges_sub = [
+        (u, v) for (u, v) in model_full.edges()
+        if u in required_nodes_lookup and v in required_nodes_lookup
+    ]
+    edges_sub = sorted(edges_sub)
 
-    # ③ Build the ancestor subgraph as a BayesianNetwork
-    model_sub = BayesianNetwork()
+    # Build the submodel with deterministic node/edge insertion order
+    model_sub = DiscreteBayesianNetwork()
     model_sub.add_nodes_from(required_nodes)
-    model_sub.add_edges_from(
-        [(u, v) for u, v in model_full.edges()
-        if u in required_nodes and v in required_nodes]
-    )
-    
-    # ④ Move CPDs for nodes in the subgraph; if missing, add a dummy uniform CPD to keep it sampleable
+    model_sub.add_edges_from(edges_sub)
+
+    # ④ Add CPDs in the same deterministic node order to avoid internal state-order drift
     for node in required_nodes:
-        try:
-            cpd = model_full.get_cpds(node)
-            model_sub.add_cpds(cpd)
-        except Exception as e:
-            print(f"⚠️ Unable to add CPD for node {node}: {str(e)}, replaced with a uniform pseudo CPD")
-            pseudo_cpd = TabularCPD(node, 2, [[0.5], [0.5]])
-            model_sub.add_cpds(pseudo_cpd)
+        cpd = model_full.get_cpds(node)
+        if cpd is None:
+            raise RuntimeError(f"Missing CPD for node={node}")
+        model_sub.add_cpds(cpd)
 
-    # ⑤ Perform a model consistency check before sampling
-    try:
-        model_sub.check_model()
-    except Exception as e:
-        print("⚠️ The submodel structure/CPD check failed:", e)
+    # ⑤ The submodel must pass the consistency check deterministically
+    model_sub.check_model()
 
-    # ⑥ Build the directed graph for downstream use (based on the *subgraph* edges)
-    graph = nx.DiGraph(model_sub.edges())
+    # ⑥ Build the downstream graph using the same sorted edges
+    #     (do NOT rely on model_sub.edges(), which may have internal ordering differences)
+    graph = nx.DiGraph()
+    graph.add_nodes_from(required_nodes)
+    graph.add_edges_from(edges_sub)
+
 
 
     all_mediators = list(get_all_mediator_path_nodes(graph, treatment, outcome))
@@ -761,7 +715,7 @@ if __name__ == '__main__':
         else:
             variance = float('nan')
         mean_est = float(np.mean(ests)) if len(ests) else float('nan')
-        mse = (0.0 if np.isnan(variance) else variance) + (mean_est ** 2)
+        mse = (0.0 if np.isnan(variance) else variance) + (mean_est ** 2) # NOTE: In this experiment the true WCDE is 0
         row = {
             'n_samples': n,
             'adjustment_set': str(list(vas_key)),
