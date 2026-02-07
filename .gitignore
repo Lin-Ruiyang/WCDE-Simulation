@@ -1,0 +1,11 @@
+# generated results / outputs
+*_results/
+**/*_results/
+
+non-bac/n*/
+non-med/n*/
+
+*.csv
+*.log
+*.png
+*.pdf
